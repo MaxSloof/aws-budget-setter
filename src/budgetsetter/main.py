@@ -1,26 +1,60 @@
 import boto3
 import datetime
-import logging
 import json
 from collections import defaultdict
+import os
+from log_config import logger
+from metadata_loader import load_metadata_from_s3, retrieve_metadata_per_workload
 
-# Configure logging
-logger = logging.getLogger()
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s",
-    level=logging.INFO,
-)
 
 # Set Boto3 clients
 sts_client = boto3.client("sts")
 ce_client = boto3.client("ce")
 budgets_client = boto3.client("budgets")
+s3_client = boto3.client("s3")
 
 # FinOps email
-finops_email = "finops@asnbank.nl"
+finops_email = os.getenv("FINOPS_EMAIL", "")
+role_arn = os.getenv("ASSUME_ROLE_ARN", "")
+account_metadata_filename = os.getenv(
+    "ACCOUNT_METADATA_FILENAME", "reference_data/lambda_automation_metadata.json"
+)
+account_metadata_bucket = os.getenv(
+    "ACCOUNT_METADATA_BUCKET", "artifacts-finops-dvb-sbx"
+)
 
 
-def get_all_accounts(start_date: str, end_date: str):
+def assume_role(role_arn):
+    """
+    Assumes the specified role and returns temporary credentials.
+    """
+    try:
+        response = sts_client.assume_role(
+            RoleArn=role_arn, RoleSessionName="FinOpsBudgetSetterSession"
+        )
+        logger.info(f"Assumed role {role_arn} successfully.")
+        return response["Credentials"]
+    except Exception as e:
+        logger.error(f"Failed to assume role {role_arn}: {e}")
+        raise
+
+
+def initialize_boto3_clients(credentials):
+    """
+    Initialize Boto3 clients using assumed role credentials.
+    """
+    assumed_session = boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+    )
+
+    ce_client = assumed_session.client("ce")
+    budgets_client = assumed_session.client("budgets")
+    return ce_client, budgets_client
+
+
+def get_all_accounts(ce_client, start_date: str, end_date: str):
     """
     Retrieves all accounts under the centralised organisation.
     """
@@ -30,7 +64,10 @@ def get_all_accounts(start_date: str, end_date: str):
         MaxResults=2000,
     )
     accounts = [
-        {"name": account["Attributes"]["description"], "id": account["Value"]}
+        {
+            "name": account.get("Attributes", {}).get("description", ""),
+            "id": account["Value"],
+        }
         for account in response["DimensionValues"]
     ]
     logger.debug("Accounts have been retrieved and stored in a dictionary")
@@ -87,7 +124,7 @@ def get_previous_month_date_range():
     ), first_day_current_month.strftime("%Y-%m-%d")
 
 
-def get_cost_for_workload(account_ids, start_date, end_date):
+def get_cost_for_workload(ce_client, account_ids, start_date, end_date):
     """
     Retrieves the total cost for the provided account IDs for the period between
     start_date and end_date using Cost Explorer. End date is first day of current month!
@@ -121,7 +158,7 @@ def get_cost_for_workload(account_ids, start_date, end_date):
 def format_notification(
     budget_percentage: int, workload_email: str | None = None
 ) -> dict:
-    if workload_email:
+    if workload_email and workload_email != finops_email:
         return {
             "Notification": {
                 "NotificationType": "ACTUAL",
@@ -151,6 +188,7 @@ def format_notification(
 
 
 def create_or_update_budget(
+    budgets_client,
     budget_name,
     budget_amount,
     root_account: str,
@@ -185,8 +223,8 @@ def create_or_update_budget(
     }
 
     notifications_with_subscribers = [
-        format_notification(95, workload_email),  # 95% Alert notification
-        format_notification(115, workload_email),  # 115% Alert notification
+        format_notification(105, workload_email),  # 105% Alert notification
+        format_notification(120, workload_email),  # 120% Alert notification
     ]
 
     logger.debug(notifications_with_subscribers)
@@ -227,7 +265,7 @@ def create_or_update_budget(
         logger.error(f"Failed to create budget '{budget_name}': {e}")
 
 
-def lambda_handler(event, context):
+def handler(event, context):
     """
     Lambda handler for the FinOps BudgetSetter.
     Triggered on a monthly EventBridge schedule.
@@ -238,13 +276,19 @@ def lambda_handler(event, context):
     root_account = sts_client.get_caller_identity().get("Account")
     logger.info(f"Operating in AWS Account: {root_account}")
 
+    # Assume role in the target account
+    # credentials = assume_role(role_arn)
+
+    # Initialize Boto3 clients with assumed role credentials
+    # ce_client, budgets_client = initialize_boto3_clients(credentials)
+
     # Calculate the date range for the fully completed previous month
     start_date, end_date = get_previous_month_date_range()
     logger.info(f"Cost-capture period: {start_date} to {end_date}")
 
     # Retrieve all accounts managed by the central organisation
     try:
-        accounts = get_all_accounts(start_date, end_date)
+        accounts = get_all_accounts(ce_client, start_date, end_date)
     except Exception as e:
         logger.error(f"Error listing accounts: {e}")
         return {"status": "error", "message": "Could not list accounts."}
@@ -255,31 +299,47 @@ def lambda_handler(event, context):
         logger.info("No accounts found that match the naming convention. Exiting.")
         return {"status": "success", "message": "No matching accounts."}
 
+    # Retrieve email of workloads
+    metadata_mapping = load_metadata_from_s3(
+        s3_client, account_metadata_bucket, account_metadata_filename
+    )
+    logger.info("Retrieved account metadata")
+
     # Process each workload group
     for workload, account_ids in workload_accounts.items():
         logger.info(f"Processing workload '{workload}' for account IDs: {account_ids}")
 
         # Query Cost Explorer for the workload cost during the previous month
-        cost = get_cost_for_workload(account_ids, start_date, end_date)
+        cost = get_cost_for_workload(ce_client, account_ids, start_date, end_date)
+
+        # Minimum budget is 50 USD to avoid email spam
+        if cost < 50:
+            logger.info("Cost under 50 USD. Setting budget to 50 to avoid email spam")
+            cost = 50
 
         logger.info(f"Workload '{workload}' - Set budget amount: {cost:.2f} USD")
 
         # Construct a budget name. For example: "Budget-ecommerce"
         budget_name = f"AUTO-workload-{workload}"
 
-        # Determine the email for alerting. This can be a mapping, or using a default pattern.
-        # Here we use a default pattern (e.g. workload name in lowercase plus a fixed domain)
-        # workload_email = f"{workload.lower()}@example.com"  # Modify as required.
-
-        # logger.info(f"Alert notifications will be sent to: {workload_email} and {finops_email}")
+        # Get the workload email, defaulting to None if not found
+        workload_email = retrieve_metadata_per_workload(
+            workload, account_ids, metadata_mapping
+        )
 
         # Create or update the budget and configure its notifications
-        create_or_update_budget(budget_name, cost, root_account, account_ids)
-        # break
+        create_or_update_budget(
+            budgets_client,
+            budget_name,
+            cost,
+            root_account,
+            account_ids,
+            workload_email,
+        )
 
     logger.info("FinOps BudgetSetter Lambda completed successfully")
     return {"status": "success"}
 
 
 if __name__ == "__main__":
-    lambda_handler({}, {})
+    handler({}, {})
