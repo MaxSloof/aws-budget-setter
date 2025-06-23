@@ -9,9 +9,9 @@ import json
 import base64
 
 base_url = os.getenv("SERVICENOW_BASE_URL", None)
-username = os.getenv("SERVICENOW_USER", None)
-password = os.getenv("SERVICENOW_PASSWORD", None)
-finops_bucket = os.getenv("FINOPS_BUCKET", "")
+username_path = os.getenv("SERVICENOW_USER_PATH", None)
+password_path = os.getenv("SERVICENOW_PASSWORD_PATH", None)
+finops_bucket = os.getenv("FINOPS_BUCKET", "artifacts-finops-dvb-sbx")
 cloudintelligence_bucket = os.getenv("CLOUDINTELLIGENCE_BUCKET", finops_bucket)
 cudos_filename = os.getenv(
     "CUDOS_FILENAME", "reference_data/cudos_account_metadata.txt"
@@ -21,6 +21,10 @@ finops_automation_filename = os.getenv(
 )
 
 s3_client = boto3.client("s3")
+ssm_client = boto3.client("ssm")
+
+username = ssm_client.get_parameter(Name=username_path, WithDecryption=True)['Parameter']['Value']
+password = ssm_client.get_parameter(Name=password_path, WithDecryption=True)['Parameter']['Value']
 
 # URL and headers setup
 data_format = "CSV"

@@ -51,7 +51,8 @@ def initialize_boto3_clients(credentials):
 
     ce_client = assumed_session.client("ce")
     budgets_client = assumed_session.client("budgets")
-    return ce_client, budgets_client
+    sts_core_mgmt_client = assumed_session.client("sts")
+    return ce_client, budgets_client, sts_core_mgmt_client
 
 
 def get_all_accounts(ce_client, start_date: str, end_date: str):
@@ -272,15 +273,15 @@ def handler(event, context):
     """
     logger.info("FinOps BudgetSetter Lambda started")
 
-    # Get the caller's account ID (this account is where the budgets are managed)
-    root_account = sts_client.get_caller_identity().get("Account")
-    logger.info(f"Operating in AWS Account: {root_account}")
-
     # Assume role in the target account
-    # credentials = assume_role(role_arn)
+    credentials = assume_role(role_arn)
 
     # Initialize Boto3 clients with assumed role credentials
-    # ce_client, budgets_client = initialize_boto3_clients(credentials)
+    ce_client, budgets_client, sts_core_mgmt_client = initialize_boto3_clients(credentials)
+
+    # Get the caller's account ID (this account is where the budgets are managed)
+    root_account = sts_core_mgmt_client.get_caller_identity().get("Account")
+    logger.info(f"Operating in AWS Account: {root_account}")
 
     # Calculate the date range for the fully completed previous month
     start_date, end_date = get_previous_month_date_range()
@@ -312,10 +313,10 @@ def handler(event, context):
         # Query Cost Explorer for the workload cost during the previous month
         cost = get_cost_for_workload(ce_client, account_ids, start_date, end_date)
 
-        # Minimum budget is 50 USD to avoid email spam
-        if cost < 50:
-            logger.info("Cost under 50 USD. Setting budget to 50 to avoid email spam")
-            cost = 50
+        # Minimum budget is 500 USD to avoid email spam
+        if cost < 500:
+            logger.info("Cost under 500 USD. Setting budget to 500 to avoid email spam")
+            cost = 500
 
         logger.info(f"Workload '{workload}' - Set budget amount: {cost:.2f} USD")
 
